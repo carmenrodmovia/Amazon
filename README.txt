@@ -1,0 +1,1 @@
+Sube estos archivos a Railway. Usa el comando 'Deploy from GitHub/Zip'.
