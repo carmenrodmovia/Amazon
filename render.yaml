@@ -1,8 +1,10 @@
 services:
-  - type: worker
+  - type: web
     name: amazon-bot
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python app.py"
     autoDeploy: true
+    envVars:
+      PORT: 10000
