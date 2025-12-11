@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Amazon camouflaged scraper (Option B)
-- Rotating, realistic headers (sec-ch-ua, sec-fetch-*, referer, etc.)
-- Session with cookies, retries and backoff
-- Random human-like delays
-- CAPTCHA/robot detection and saving HTML to captcha/
-- Persistence (data.json) for new products and price drops
-- Telegram notifications (text + sendPhoto fallback)
-- Daily summary and logs
+Amazon camouflaged scraper (Option B) - Modificado según solicitud:
+- Envía 1 producto cada 10 minutos
+- Mensaje con formato:
+    Título
+    💰 Precio: xx.xx €
+    📉 Precio recomendado: xx.xx €
+    🔥 -46.0% de descuento
+    URL imagen
+    https://www.amazon.es/dp/ASIN?tag=crt06f-21&linkCode=ogi&th=1&psc=1
+- Mantiene captcha saving, retries, headers, persistence, resumen diario, logs, Flask keepalive
 """
 import os
 import time
@@ -38,6 +40,10 @@ DAILY_FILE = os.getenv("DAILY_FILE", "daily.json")
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 CAPTCHA_DIR = os.getenv("CAPTCHA_DIR", "captcha")
 PORT = int(os.getenv("PORT", "10000"))
+
+# Rate limiting: 1 send / 10 minutes
+SEND_INTERVAL = 600  # seconds (10 minutes)
+LAST_SEND_TS = 0
 
 # ensure necessary dirs
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -81,17 +87,11 @@ def start_web():
 # -------------------------
 # Advanced headers and variants
 # -------------------------
-# realistic UA list (desktop + mobile)
 USER_AGENTS = [
-    # Chrome desktop
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-    # Firefox desktop
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
-    # Safari macOS
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-    # Chrome mobile
     "Mozilla/5.0 (Linux; Android 13; Pixel 7a) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Mobile Safari/537.36",
-    # iPhone Safari
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
 ]
 
@@ -122,7 +122,6 @@ def build_headers():
         "Referer": random.choice(REFERERS),
         "Cache-Control": "max-age=0",
         "Upgrade-Insecure-Requests": "1",
-        # emulated client hints (not all servers use them but add for realism)
         "Sec-CH-UA": sec_ch_ua,
         "Sec-CH-UA-Mobile": "?0" if "Mobile" not in ua else "?1",
         "Sec-Fetch-Site": "same-origin",
@@ -160,7 +159,7 @@ def send_telegram_photo_by_url(photo_url: str, caption: str) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
     payload = {"chat_id": CHAT_ID, "photo": photo_url, "caption": caption, "parse_mode": "HTML"}
     try:
-        r = session.post(url, json=payload, timeout=15)
+        r = session.post(url, json=payload, timeout=20)
         log(f"Telegram sendPhoto status: {r.status_code}")
         return r.status_code == 200
     except Exception as e:
@@ -196,7 +195,6 @@ def parse_price(price_text):
     try:
         txt = price_text.replace("\u20ac", "").replace("€", "").strip()
         txt = txt.replace(".", "").replace(",", ".")
-        # filter digits and dot
         filtered = "".join(ch for ch in txt if (ch.isdigit() or ch == "."))
         if filtered == "":
             return None
@@ -215,11 +213,9 @@ def extract_asin(div):
     asin = div.get("data-asin")
     if asin and len(asin) > 5:
         return asin
-    # look for links with /dp/ASIN
     a = div.select_one("a[href]")
     if a and a.get("href"):
         href = a.get("href")
-        # common pattern /dp/B0... or /gp/product/B0...
         import re
         m = re.search(r"/(dp|gp/product)/([A-Z0-9]{8,12})", href)
         if m:
@@ -266,7 +262,6 @@ def analyze_page(url, max_retries=3):
             r = session.get(url, headers=headers, timeout=20)
         except Exception as e:
             log(f"❌ Error GET {url}: {e} (attempt {attempt})")
-            # backoff
             time.sleep(2 ** attempt + random.uniform(0.5, 1.5))
             continue
 
@@ -276,11 +271,9 @@ def analyze_page(url, max_retries=3):
         log(f"➡ Status {status} (attempt {attempt})")
         snippet = (html or "")[:1000].replace("\n", " ")
         log("➡ Snippet: " + snippet[:800] + ("..." if len(snippet) > 800 else ""))
-        # detect captcha / robot
         if detect_captcha(html):
             log("⚠️ Detectado CAPTCHA/Robot check en la página.")
             save_captcha_html(html, url)
-            # change session cookies and headers and retry
             session.cookies.clear()
             log("🧹 Cookies limpiadas; cambiando UA y reintentando...")
             time.sleep(random.uniform(3.0, 6.0))
@@ -291,14 +284,12 @@ def analyze_page(url, max_retries=3):
             time.sleep(2 ** attempt + random.uniform(1, 2))
             continue
 
-        # Parse HTML
         try:
             soup = BeautifulSoup(html, "lxml")
         except Exception as e:
             log(f"⚠️ BeautifulSoup error: {e}")
             return []
 
-        # Amazon uses div.s-result-item but also other structures; filter by ASIN
         product_divs = soup.select("div.s-result-item")
         resultados = []
         for div in product_divs:
@@ -306,13 +297,10 @@ def analyze_page(url, max_retries=3):
                 asin = extract_asin(div)
                 if not asin:
                     continue
-                # title
                 h2 = div.select_one("h2")
                 title = h2.get_text(strip=True) if h2 else None
-                # price - Amazon often hides price in span.a-offscreen
                 price_span = div.select_one("span.a-offscreen")
                 price = parse_price(price_span.get_text(strip=True)) if price_span else None
-                # link
                 a = div.select_one("a.a-link-normal[href]")
                 link = None
                 if a and a.get("href"):
@@ -321,12 +309,10 @@ def analyze_page(url, max_retries=3):
                         link = "https://www.amazon.es" + href
                     elif href.startswith("http"):
                         link = href
-                # image: get src or data-src
                 img = div.select_one("img")
                 img_url = None
                 if img:
                     img_url = img.get("data-src") or img.get("data-old-hires") or img.get("src") or img.get("data-a-dynamic-image")
-                # keep entries with title and link
                 if title and link:
                     resultados.append({"asin": asin, "titulo": title, "precio": price, "link": link, "image": img_url})
             except Exception as e:
@@ -334,13 +320,10 @@ def analyze_page(url, max_retries=3):
                 continue
 
         log(f"➡ Productos parseados: {len(resultados)}")
-        # polite sleep after successful fetch
         time.sleep(random.uniform(1.5, 3.8))
         return resultados
 
-    # exhausted retries
     log("❌ Exceso de reintentos; devolviendo vacío.")
-    # save last html for debugging
     if last_html:
         save_captcha_html(last_html, url + "_lasthtml")
     return []
@@ -366,27 +349,18 @@ def get_and_clear_today_changes():
     return changes
 
 # -------------------------
-# Small helpers for json funcs (use defined above)
+# Rate limiting helper: 1 send / SEND_INTERVAL seconds
 # -------------------------
-def cargar_json(path, default):
-    if not os.path.exists(path):
-        return default
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        log(f"⚠️ Error cargando {path}: {e}")
-        return default
-
-def guardar_json(path, data):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-    except Exception as e:
-        log(f"⚠️ Error guardando {path}: {e}")
+def can_send_product():
+    global LAST_SEND_TS
+    now = time.time()
+    if now - LAST_SEND_TS >= SEND_INTERVAL:
+        LAST_SEND_TS = now
+        return True
+    return False
 
 # -------------------------
-# Main process: new + price drop logic
+# Main process: new + price drop logic (with rate limiting)
 # -------------------------
 def process_once(history, tags):
     any_changes = False
@@ -407,46 +381,100 @@ def process_once(history, tags):
                     image = prod.get("image")
 
                     if precio is None:
-                        # skip items without price (can't compare)
                         continue
 
                     prev = history.get(asin)
-                    # NEW
+                    # NEW PRODUCT
                     if prev is None:
-                        msg = (f"🆕 <b>NUEVO PRODUCTO</b>\n"
-                               f"🛒 <b>{titulo}</b>\n"
-                               f"💶 Precio: {precio}€\n"
-                               f"🔗 {link}")
+                        # Build affiliate link with tag crt06f-21
+                        afiliado = f"https://www.amazon.es/dp/{asin}?tag=crt06f-21&linkCode=ogi&th=1&psc=1"
+                        # For new products, recommended price = current price (no previous)
+                        precio_recomendado = precio
+                        descuento_pct = 0.0
+
+                        # Format the exact message requested
+                        try:
+                            msg = (
+                                f"{titulo}\n"
+                                f"💰 Precio: {precio:.2f} €\n"
+                                f"📉 Precio recomendado: {precio_recomendado:.2f} €\n"
+                                f"🔥 -{descuento_pct:.1f}% de descuento\n"
+                                f"{image or ''}\n"
+                                f"{afiliado}"
+                            )
+                        except Exception:
+                            # fallback if precio is not float-like
+                            msg = (
+                                f"{titulo}\n"
+                                f"💰 Precio: {precio} €\n"
+                                f"📉 Precio recomendado: {precio_recomendado} €\n"
+                                f"🔥 -{descuento_pct:.1f}% de descuento\n"
+                                f"{image or ''}\n"
+                                f"{afiliado}"
+                            )
+
                         sent = False
-                        if image:
-                            sent = send_telegram_photo_by_url(image, msg)
-                            if not sent:
-                                sent = send_telegram_text(msg)
-                        else:
-                            sent = send_telegram_text(msg)
-                        log(f"Nuevo {asin} enviado: {sent}")
-                        history[asin] = {"titulo": titulo, "precio": precio, "link": link, "last_seen": datetime.now().isoformat()}
-                        append_daily_change({"type": "new", "asin": asin, "titulo": titulo, "new": precio, "link": link, "time": datetime.now().isoformat()})
-                        any_changes = True
-                    else:
-                        prev_price = prev.get("precio") if prev.get("precio") is not None else prev.get("price")
-                        if prev_price is not None and precio < prev_price:
-                            msg = (f"📉 <b>BAJADA DE PRECIO</b>\n"
-                                   f"🛒 <b>{titulo}</b>\n"
-                                   f"⬇ Antes: {prev_price}€\n"
-                                   f"🟢 Ahora: {precio}€\n"
-                                   f"🔗 {link}")
-                            sent = False
+                        if can_send_product():
                             if image:
                                 sent = send_telegram_photo_by_url(image, msg)
                                 if not sent:
                                     sent = send_telegram_text(msg)
                             else:
                                 sent = send_telegram_text(msg)
-                            log(f"Bajada {asin} enviada: {sent}")
+                            log(f"Nuevo {asin} enviado: {sent}")
+                        else:
+                            log(f"⏳ Limitado: NO se envió (nuevo) {asin} — esperar siguiente intervalo.")
+
+                        # Save to history (use affiliate link as saved link)
+                        history[asin] = {"titulo": titulo, "precio": precio, "link": afiliado, "last_seen": datetime.now().isoformat()}
+                        append_daily_change({"type": "new", "asin": asin, "titulo": titulo, "new": precio, "link": afiliado, "time": datetime.now().isoformat()})
+                        any_changes = True
+
+                    else:
+                        # previous price may be stored under "precio" or "price"
+                        prev_price = prev.get("precio") if prev.get("precio") is not None else prev.get("price")
+                        if prev_price is not None and precio < prev_price:
+                            afiliado = f"https://www.amazon.es/dp/{asin}?tag=crt06f-21&linkCode=ogi&th=1&psc=1"
+                            try:
+                                descuento = round((prev_price - precio) / prev_price * 100, 1)
+                            except Exception:
+                                descuento = 0.0
+
+                            try:
+                                msg = (
+                                    f"{titulo}\n"
+                                    f"💰 Precio: {precio:.2f} €\n"
+                                    f"📉 Precio recomendado: {prev_price:.2f} €\n"
+                                    f"🔥 -{descuento:.1f}% de descuento\n"
+                                    f"{image or ''}\n"
+                                    f"{afiliado}"
+                                )
+                            except Exception:
+                                msg = (
+                                    f"{titulo}\n"
+                                    f"💰 Precio: {precio} €\n"
+                                    f"📉 Precio recomendado: {prev_price} €\n"
+                                    f"🔥 -{descuento:.1f}% de descuento\n"
+                                    f"{image or ''}\n"
+                                    f"{afiliado}"
+                                )
+
+                            sent = False
+                            if can_send_product():
+                                if image:
+                                    sent = send_telegram_photo_by_url(image, msg)
+                                    if not sent:
+                                        sent = send_telegram_text(msg)
+                                else:
+                                    sent = send_telegram_text(msg)
+                                log(f"Bajada {asin} enviada: {sent}")
+                            else:
+                                log(f"⏳ Limitado: NO se envió (bajada) {asin} — esperar siguiente intervalo.")
+
+                            # update history price & last_seen
                             history[asin]["precio"] = precio
                             history[asin]["last_seen"] = datetime.now().isoformat()
-                            append_daily_change({"type": "drop", "asin": asin, "titulo": titulo, "old": prev_price, "new": precio, "link": link, "time": datetime.now().isoformat()})
+                            append_daily_change({"type": "drop", "asin": asin, "titulo": titulo, "old": prev_price, "new": precio, "link": afiliado, "time": datetime.now().isoformat()})
                             any_changes = True
                         else:
                             # update last seen only
@@ -456,7 +484,6 @@ def process_once(history, tags):
                 time.sleep(random.uniform(3.5, 7.5))
             except Exception as e:
                 log(f"⚠️ Error procesando URL {url}: {e}\n{traceback.format_exc()}")
-                # short sleep on error
                 time.sleep(random.uniform(2.0, 5.0))
     return any_changes
 
