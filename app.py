@@ -11,6 +11,7 @@ Amazon camouflaged scraper (Option B) - Modificado según solicitud:
     URL imagen
     https://www.amazon.es/dp/ASIN?tag=crt06f-21&linkCode=ogi&th=1&psc=1
 - Mantiene captcha saving, retries, headers, persistence, resumen diario, logs, Flask keepalive
+- Persistencia del timestamp de último envío para evitar ráfagas tras reinicios
 """
 import os
 import time
@@ -40,10 +41,11 @@ DAILY_FILE = os.getenv("DAILY_FILE", "daily.json")
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 CAPTCHA_DIR = os.getenv("CAPTCHA_DIR", "captcha")
 PORT = int(os.getenv("PORT", "10000"))
+SEND_TS_FILE = os.getenv("SEND_TS_FILE", "send_ts.json")
 
 # Rate limiting: 1 send / 10 minutes
 SEND_INTERVAL = 600  # seconds (10 minutes)
-LAST_SEND_TS = 0
+LAST_SEND_TS = 0.0
 
 # ensure necessary dirs
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -187,6 +189,29 @@ def guardar_json(path, data):
         log(f"⚠️ Error guardando {path}: {e}")
 
 # -------------------------
+# Load/save last send timestamp (persist across restarts)
+# -------------------------
+def _load_last_send_ts():
+    global LAST_SEND_TS
+    try:
+        data = cargar_json(SEND_TS_FILE, {})
+        ts = data.get("last_send_ts")
+        if isinstance(ts, (int, float)):
+            LAST_SEND_TS = float(ts)
+            log(f"Último timestamp de envío cargado: {LAST_SEND_TS} ({datetime.fromtimestamp(LAST_SEND_TS) if LAST_SEND_TS>0 else 'never'})")
+        else:
+            LAST_SEND_TS = 0.0
+    except Exception as e:
+        log(f"⚠️ Error cargando {SEND_TS_FILE}: {e}")
+        LAST_SEND_TS = 0.0
+
+def _save_last_send_ts():
+    try:
+        guardar_json(SEND_TS_FILE, {"last_send_ts": LAST_SEND_TS})
+    except Exception as e:
+        log(f"⚠️ Error guardando {SEND_TS_FILE}: {e}")
+
+# -------------------------
 # Utility: price parser
 # -------------------------
 def parse_price(price_text):
@@ -194,6 +219,7 @@ def parse_price(price_text):
         return None
     try:
         txt = price_text.replace("\u20ac", "").replace("€", "").strip()
+        # Remove thousands separator and unify decimal comma
         txt = txt.replace(".", "").replace(",", ".")
         filtered = "".join(ch for ch in txt if (ch.isdigit() or ch == "."))
         if filtered == "":
@@ -356,6 +382,7 @@ def can_send_product():
     now = time.time()
     if now - LAST_SEND_TS >= SEND_INTERVAL:
         LAST_SEND_TS = now
+        _save_last_send_ts()
         return True
     return False
 
@@ -517,6 +544,8 @@ def send_daily_summary_if_time():
 # -------------------------
 def main_loop():
     log("🔔 Bot iniciado (camuflaje total).")
+    # load last send ts persisted on disk
+    _load_last_send_ts()
     send_telegram_text("🟢 Bot Amazon ejecutado en Render (modo camuflaje total).")
     history = cargar_json(DATA_FILE, {})
     tags = [t.strip() for t in TAGS_ENV.split(",") if t.strip()]
