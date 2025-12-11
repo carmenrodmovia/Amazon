@@ -1,0 +1,7 @@
+services:
+  - type: worker
+    name: amazon-worker
+    env: python
+    region: frankfurt
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python app.py"
