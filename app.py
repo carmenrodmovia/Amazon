@@ -1,11 +1,11 @@
 import requests
 from bs4 import BeautifulSoup
-import pandas as pd
 import time
 import os
 import threading
 from flask import Flask
 import json
+import random
 
 ###############################################################
 # SERVIDOR WEB PARA MANTENER EL SERVICIO VIVO EN RENDER
@@ -22,15 +22,30 @@ def start_web():
 
 
 ###############################################################
-# FUNCIÓN MEJORADA PARA ENVIAR MENSAJES A TELEGRAM
+# HEADERS ROTATIVOS - EVITA BLOQUEOS DE AMAZON
+###############################################################
+def get_headers():
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+    ]
+
+    return {
+        "User-Agent": random.choice(user_agents),
+        "Accept-Language": "es-ES,es;q=0.9"
+    }
+
+
+###############################################################
+# ENVIAR MENSAJE A TELEGRAM
 ###############################################################
 def send_telegram(message: str):
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
     CHAT_ID = os.getenv("CHAT_ID")
-    TAG = "crt06f-21"
 
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("❌ ERROR TELEGRAM: Falta TELEGRAM_TOKEN o CHAT_ID en las variables de entorno.")
+        print("❌ ERROR TELEGRAM: Falta TELEGRAM_TOKEN o CHAT_ID.")
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -41,56 +56,55 @@ def send_telegram(message: str):
     }
 
     try:
-        print("📤 Enviando mensaje a Telegram…")
-        print(f"➡ URL: {url}")
-        print(f"➡ PAYLOAD: {payload}")
-
         response = requests.post(url, json=payload, timeout=15)
-        print(f"➡ STATUS CODE: {response.status_code}")
-
-        try:
-            data = response.json()
-            print(f"➡ RESPUESTA TELEGRAM: {json.dumps(data, indent=2)}")
-        except:
-            print("⚠️ No se pudo interpretar JSON de Telegram.")
-
-        if response.status_code != 200:
-            print("❌ ERROR: Telegram devolvió un código no exitoso.")
-            return False
-
-        if not data.get("ok", False):
-            print("❌ ERROR: Telegram respondió ok = false.")
-            return False
-
-        print("✅ Mensaje enviado a Telegram correctamente.")
-        return True
-
+        return response.status_code == 200
     except Exception as e:
-        print(f"❌ EXCEPCIÓN EN TELEGRAM: {e}")
+        print(f"❌ ERROR TELEGRAM: {e}")
         return False
 
 
 ###############################################################
-# SCRAPER AMAZON (TU LÓGICA DE BÚSQUEDA)
+# ARCHIVO DE HISTORIAL (NUEVOS / BAJADAS DE PRECIO)
+###############################################################
+DATA_FILE = "data.json"
+
+def cargar_historial():
+    if not os.path.exists(DATA_FILE):
+        return {}
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def guardar_historial(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+
+###############################################################
+# SCRAPER AMAZON
 ###############################################################
 def obtener_urls_busqueda(termino, paginas=3):
-    urls = []
-    for pagina in range(1, paginas + 1):
-        url = f"https://www.amazon.es/s?k={termino}&page={pagina}"
-        urls.append(url)
-    return urls
+    return [
+        f"https://www.amazon.es/s?k={termino}&page={pagina}"
+        for pagina in range(1, paginas + 1)
+    ]
 
+def extraer_asin(div):
+    """Busca el ASIN dentro del div del producto."""
+    asin = div.get("data-asin")
+    if asin and len(asin) > 5:
+        return asin
+    return None
 
 def analizar_pagina(url):
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept-Language": "es-ES,es;q=0.9"
-        }
+        headers = get_headers()
         r = requests.get(url, headers=headers, timeout=15)
 
         if r.status_code != 200:
-            print(f"⚠️ Amazon devolvió {r.status_code} en {url}")
+            print(f"⚠️ Amazon devolvió {r.status_code}")
             return []
 
         soup = BeautifulSoup(r.text, "lxml")
@@ -99,14 +113,19 @@ def analizar_pagina(url):
         resultados = []
 
         for p in productos:
+            asin = extraer_asin(p)
+            if not asin:
+                continue
+
             titulo = p.select_one("h2")
             precio = p.select_one("span.a-offscreen")
             enlace = p.select_one("a.a-link-normal")
 
             if titulo and precio and enlace:
                 resultados.append({
+                    "asin": asin,
                     "titulo": titulo.get_text(strip=True),
-                    "precio": precio.get_text(strip=True),
+                    "precio": float(precio.get_text(strip=True).replace("€", "").replace(",", ".")),
                     "link": "https://www.amazon.es" + enlace["href"]
                 })
 
@@ -118,44 +137,67 @@ def analizar_pagina(url):
 
 
 ###############################################################
-# PROCESO PRINCIPAL DEL BOT
+# PROCESO PRINCIPAL: SOLO ENVIAR NUEVOS Y BAJADAS DE PRECIO
 ###############################################################
 def main():
-    print("🔎 Enviando mensaje de prueba a Telegram…")
-    send_telegram("🟢 TEST: El bot de Amazon está funcionando en Render.")
+    send_telegram("🟢 Bot Amazon ejecutado en Render (modo ofertas activado).")
 
+    historial = cargar_historial()
     termino_busqueda = os.getenv("TAG", "decoración navidad")
-
-    print(f"🔍 Buscando productos para: {termino_busqueda}")
-
     urls = obtener_urls_busqueda(termino_busqueda, paginas=3)
 
     for url in urls:
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Analizando: {url}")
-
         productos = analizar_pagina(url)
 
         for prod in productos:
-            mensaje = (
-                f"🛒 <b>{prod['titulo']}</b>\n"
-                f"💶 Precio: {prod['precio']}\n"
-                f"🔗 {prod['link']}"
-            )
-            send_telegram(mensaje)
+            asin = prod["asin"]
+            titulo = prod["titulo"]
+            precio = prod["precio"]
+            link = prod["link"]
 
+            # Producto NUEVO
+            if asin not in historial:
+                mensaje = (
+                    f"🆕 <b>NUEVO PRODUCTO</b>\n"
+                    f"🛒 <b>{titulo}</b>\n"
+                    f"💶 Precio: {precio}€\n"
+                    f"🔗 {link}"
+                )
+                send_telegram(mensaje)
+
+                historial[asin] = {
+                    "titulo": titulo,
+                    "precio": precio,
+                    "link": link
+                }
+                continue
+
+            # Bajada de precio
+            precio_anterior = historial[asin]["precio"]
+            if precio < precio_anterior:
+                mensaje = (
+                    f"📉 <b>BAJADA DE PRECIO</b>\n"
+                    f"🛒 <b>{titulo}</b>\n"
+                    f"⬇ Antes: {precio_anterior}€\n"
+                    f"🟢 Ahora: {precio}€\n"
+                    f"🔗 {link}"
+                )
+                send_telegram(mensaje)
+
+                historial[asin]["precio"] = precio
+
+        # Después de cada página, guardamos
+        guardar_historial(historial)
         time.sleep(10)
 
-    print("🔁 Ciclo completado. Esperando 10 minutos…")
+    # Ciclo cada 10 minutos
     time.sleep(600)
-    main()  # bucle infinito
+    main()
 
 
 ###############################################################
 # EJECUCIÓN PARA RENDER
 ###############################################################
 if __name__ == "__main__":
-    # Servidor web en paralelo para Render
     threading.Thread(target=start_web).start()
-
-    # Bot principal
     main()
