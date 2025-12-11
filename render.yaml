@@ -7,4 +7,5 @@ services:
     startCommand: "python app.py"
     autoDeploy: true
     envVars:
-      PORT: 10000
+      - key: PORT
+        value: 10000
