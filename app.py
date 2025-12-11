@@ -1,29 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import requests
-import random
-import time
-import pandas as pd
-from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
 import os
+import time
+import threading
+import random
+import requests
+import pandas as pd
 import json
 import traceback
 import re
+from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
+from flask import Flask
 
+# ============================================================
+#                 CONFIG (variables de entorno)
+# ============================================================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+TAG = os.getenv("TAG", "crt06f-21")
 
-
-# ---------------- CONFIG ----------------
-#TELEGRAM_TOKEN = "7711722254:AAFV4bj2aQtbVKpa1gkMUyqlhkCzytRoubg"
-TELEGRAM_TOKEN  = "7711722254:AAFAscovZ44PJpbYuJHKVgFevSNy-himSc4"
-#ofertas prime
-#CHAT_ID = "-1002428790704"
-#ofertas colegio
-CHAT_ID = "-1003179746715"
-TAG = "crt06f-21"
+if not TELEGRAM_TOKEN or not CHAT_ID:
+    print("❌ ERROR: Falta TELEGRAM_TOKEN o CHAT_ID en las variables de entorno.")
+    time.sleep(5)
 
 EXCEL_FILE = "productos.xlsx"
+DESCARTADOS_FILE = "descartados.json"
 LOG_FILE = "log.txt"
 
 ENVIADOS_DIR = "enviados"
@@ -31,24 +34,29 @@ HISTORIAL_FILE = "enviados_historial.json"
 NO_REPEAT_DAYS = 15
 
 PALABRAS_CLAVE = [
-    "Hogar",
-    "ropa",
-    "juguetes",
-    "juegos",
-    "bebé",
-    "deporte"
+     "cuidado personal", "sudaderas", "decoración navidad", "cocina", "reloj", "salud"
 ]
 
 HEADERS_ROTATIVOS = [
-    {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"},
-    {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/121.0"},
-    {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15"},
+    {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+    {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"},
+    {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X)"},
 ]
 
 MIN_DESCUENTO_PCT = 10
-BLACK_FRIDAY_PCT = 30
 
-# ----------------- UTILIDADES -----------------
+# ============================================================
+#                        COLORES
+# ============================================================
+OK = "\033[92m"
+WARN = "\033[93m"
+ERR = "\033[91m"
+CYAN = "\033[96m"
+RESET = "\033[0m"
+
+# ============================================================
+#                        UTILIDADES
+# ============================================================
 def log(msg):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
@@ -60,31 +68,25 @@ def log(msg):
         pass
 
 def ensure_dirs():
-    if not os.path.exists(ENVIADOS_DIR):
-        os.makedirs(ENVIADOS_DIR, exist_ok=True)
+    os.makedirs(ENVIADOS_DIR, exist_ok=True)
 
 def cargar_historial():
     if not os.path.exists(HISTORIAL_FILE):
         return {}
     try:
-        with open(HISTORIAL_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return json.load(open(HISTORIAL_FILE, "r", encoding="utf-8"))
     except:
         return {}
 
 def guardar_historial(hist):
-    try:
-        with open(HISTORIAL_FILE, "w", encoding="utf-8") as f:
-            json.dump(hist, f, indent=4, ensure_ascii=False)
-    except Exception as e:
-        log(f"Error guardando historial: {e}")
+    json.dump(hist, open(HISTORIAL_FILE, "w", encoding="utf-8"), indent=4, ensure_ascii=False)
 
 def fue_enviado_recientemente(asin, historial):
     if asin not in historial:
         return False
     try:
-        fecha_envio = datetime.fromisoformat(historial[asin])
-        return datetime.now() - fecha_envio < timedelta(days=NO_REPEAT_DAYS)
+        fecha = datetime.fromisoformat(historial[asin])
+        return datetime.now() - fecha < timedelta(days=NO_REPEAT_DAYS)
     except:
         return False
 
@@ -92,251 +94,311 @@ def registrar_envio(asin, historial):
     historial[asin] = datetime.now().isoformat()
     guardar_historial(historial)
 
-# ----------------- ASIN & URL -----------------
+def registrar_descartado(asin, motivo, precio, precio_ant, descuento):
+    entry = {
+        "fecha": datetime.now().isoformat(),
+        "asin": asin,
+        "motivo": motivo,
+        "precio_actual": precio,
+        "precio_recomendado": precio_ant,
+        "descuento_pct": descuento
+    }
+    data = []
+    if os.path.exists(DESCARTADOS_FILE):
+        try:
+            data = json.load(open(DESCARTADOS_FILE, "r", encoding="utf-8"))
+        except:
+            pass
+
+    data.append(entry)
+    json.dump(data, open(DESCARTADOS_FILE, "w", encoding="utf-8"), indent=4, ensure_ascii=False)
+
+    log(f"{WARN}[DESCARTADO]{RESET} {asin} → {motivo}")
+
+
+# ============================================================
+#                     AMAZON SCRAPING
+# ============================================================
 def extract_asin(url):
-    try:
-        m = re.search(r"/dp/([A-Z0-9]{10})", url)
-        if m: return m.group(1)
-        m = re.search(r"/gp/product/([A-Z0-9]{10})", url)
-        if m: return m.group(1)
-        m = re.search(r"/([A-Z0-9]{10})(?:[/?]|$)", url)
-        if m: return m.group(1)
-    except:
-        return None
+    pats = [
+        r"/dp/([A-Z0-9]{10})",
+        r"/gp/product/([A-Z0-9]{10})",
+        r"/([A-Z0-9]{10})(?:[/?]|$)"
+    ]
+    for p in pats:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
     return None
 
 def crear_url_afiliado(asin):
-    return f"https://www.amazon.es/dp/{asin}?tag={TAG}&linkCode=ogi&th=1&psc=1"
+    return f"https://www.amazon.es/dp/{asin}?tag={TAG}&psc=1"
 
 def crear_url_scrape(asin):
     return f"https://www.amazon.es/dp/{asin}"
 
-# ----------------- HTTP -----------------
 def scraperapi_get(url):
     headers = random.choice(HEADERS_ROTATIVOS)
     try:
-        time.sleep(random.uniform(1.5, 3.0))
-        r = requests.get(url, headers=headers, timeout=25)
+        time.sleep(random.uniform(1.5, 3))
+        r = requests.get(url, headers=headers, timeout=20)
+
         if r.status_code == 200:
             return r.text
+
         if r.status_code in (403, 503):
-            log(f"Amazon bloqueó ({r.status_code}). Reintentando con otro header...")
-            time.sleep(random.uniform(2, 5))
-            headers = random.choice(HEADERS_ROTATIVOS)
-            r = requests.get(url, headers=headers, timeout=25)
+            log(f"{WARN}Amazon bloqueó ({r.status_code}). Reintentando...{RESET}")
+            time.sleep(2)
+            r = requests.get(url, headers=random.choice(HEADERS_ROTATIVOS), timeout=20)
             if r.status_code == 200:
                 return r.text
-        log(f"Error HTTP {r.status_code} para {url}")
-        return None
-    except Exception as e:
-        log(f"Error GET {url}: {e}")
+
+        log(f"{ERR}HTTP {r.status_code} → {url}{RESET}")
         return None
 
-# ----------------- PARSERS -----------------
-def parse_number_like_amazon(text):
+    except Exception as e:
+        log(f"{ERR}ERROR GET {url}: {e}{RESET}")
+        return None
+
+
+def parse_num(text):
     if not text:
         return None
-    text = text.replace("\xa0", "").replace("\u202f", "").replace("€","").strip()
-    text = text.replace(",", ".")
+    text = text.replace("€", "").replace(",", ".").replace("\xa0", "")
     try:
-        return float(re.findall(r"[\d\.]+", text)[0])
+        n = re.findall(r"[0-9.]+", text)[0]
+        return float(n)
     except:
         return None
 
+def extraer_precio_cupon(soup):
+    try:
+        tag = soup.select_one(".ct-coupon-tile .ct-coupon-tile-price-content .a-offscreen")
+        if tag:
+            return parse_num(tag.get_text(strip=True))
+    except:
+        pass
+    return None
+
+
 def extraer_precios(soup):
-    # Precio actual
-    precio_actual_tag = soup.select_one(".aok-offscreen")
-    precio_actual = parse_number_like_amazon(precio_actual_tag.get_text(strip=True)) if precio_actual_tag else None
+    UNIDAD_PATTERN = re.compile(
+        r"(\/\s?(kg|g|l|ml|cl|unidad|ud|100\s?g|100\s?ml|m))",
+        re.IGNORECASE
+    )
 
-    # Precio anterior
-    precio_anterior_tag = soup.select_one(".a-price.a-text-price .a-offscreen")
-    if precio_anterior_tag:
-        precio_anterior = parse_number_like_amazon(precio_anterior_tag.get_text(strip=True))
+    def es_precio_unidad(t):
+        return bool(t and UNIDAD_PATTERN.search(t))
+
+    precio_actual = None
+    for tag in soup.select(".a-price .a-offscreen"):
+        txt = tag.get_text(strip=True)
+        if not es_precio_unidad(txt):
+            num = parse_num(txt)
+            if num:
+                precio_actual = num
+                break
+
+    precio_anterior = None
+    for tag in soup.select(".a-price.a-text-price .a-offscreen"):
+        txt = tag.get_text(strip=True)
+        if not es_precio_unidad(txt):
+            num = parse_num(txt)
+            if num:
+                precio_anterior = num
+                break
+
+    if precio_actual and precio_anterior:
+        desc = round((precio_anterior - precio_actual) / precio_anterior * 100)
     else:
-        # fallback últimos 30 días
-        precio_anterior_tag = soup.select_one(".a-price.a-text-price.srpPriceBlockAUI .a-offscreen")
-        precio_anterior = parse_number_like_amazon(precio_anterior_tag.get_text(strip=True)) if precio_anterior_tag else None
+        desc = 0
 
-    # Descuento
-    descuento_tag = soup.select_one(".savingPriceOverride.aok-align-center.reinventPriceSavingsPercentageMargin.savingsPercentage")
-    if descuento_tag:
-        descuento = parse_number_like_amazon(descuento_tag.get_text(strip=True))
-    elif precio_actual and precio_anterior:
-        descuento = round((precio_anterior - precio_actual) / precio_anterior * 100)
-    else:
-        descuento = 0
+    return precio_actual, precio_anterior, desc
 
-    return precio_actual, precio_anterior, descuento
 
-def formatear_precio_europeo(valor):
-    if valor is None:
-        return "No disponible"
-    return f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") + " €"
+def fmt(v):
+    if v is None:
+        return "ND"
+    return f"{v:,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
 
-# ----------------- BÚSQUEDA PRODUCTOS -----------------
+
 def buscar_productos():
-    keyword = random.choice(PALABRAS_CLAVE)
-    pagina = random.randint(1, 3)
-    log(f"🔎 Buscando '{keyword}' página {pagina}...")
-    search_url = f"https://www.amazon.es/s?k={requests.utils.requote_uri(keyword)}&page={pagina}"
-    html = scraperapi_get(search_url)
+    kw = random.choice(PALABRAS_CLAVE)
+    pag = random.randint(1, 3)
+    log(f"{CYAN}Buscando '{kw}' página {pag}...{RESET}")
+
+    url = f"https://www.amazon.es/s?k={kw}&page={pag}"
+    html = scraperapi_get(url)
     if not html:
-        log("Sin HTML de búsqueda")
         return []
+
     soup = BeautifulSoup(html, "html.parser")
-    enlaces = soup.select("a.a-link-normal.s-no-hover.s-underline-text.s-underline-link-text, a.a-link-normal.s-no-outline, h2 a.a-link-normal")
-    urls = set()
+    enlaces = soup.select("a.a-link-normal.s-no-hover, h2 a.a-link-normal")
+
+    urls = []
     for a in enlaces:
         href = a.get("href", "")
-        if not href:
-            continue
-        if href.startswith("/"):
-            href = "https://www.amazon.es" + href
-        if "/dp/" in href or "/gp/product/" in href:
+        if "/dp/" in href:
             asin = extract_asin(href)
             if asin:
-                urls.add(crear_url_scrape(asin))
-    urls = sorted(list(urls))
-    log(f"URLs encontradas: {len(urls)}")
+                urls.append(crear_url_scrape(asin))
+
+    urls = list(set(urls))
+    log(f"Encontradas {len(urls)} URLs")
     return urls
 
-# ----------------- INFO PRODUCTO -----------------
+
 def get_product_info(url):
     asin = extract_asin(url)
     if not asin:
         return None
+
     html = scraperapi_get(url)
-    
-    ### FIX AQUÍ — indentación correcta ###
-    with open("debug.html", "w", encoding="utf-8") as f:
-        if html:
-            f.write(html)
-        else:
-            f.write("SIN HTML")
-    ### FIN DEL FIX ###
-
-    
-
     if not html:
         return None
+
     soup = BeautifulSoup(html, "html.parser")
 
-    titulo_tag = (soup.select_one("#productTitle")
-                  or soup.select_one("span.a-size-large.product-title-word-break")
-                  or soup.select_one("span.a-size-medium.a-color-base.a-text-normal")
-                  or soup.select_one("h1 span"))
-    titulo = titulo_tag.get_text(" ", strip=True) if titulo_tag else "Sin título"
+    t = soup.select_one("#productTitle")
+    titulo = t.get_text(strip=True) if t else "Sin título"
 
-    imagen_tag = (soup.select_one("#landingImage")
-                  or soup.select_one("img#imgBlkFront")
-                  or soup.select_one("img.s-image")
-                  or soup.select_one("div#imgTagWrapperId img"))
-    imagen = None
-    if imagen_tag:
-        imagen = imagen_tag.get("src") or imagen_tag.get("data-src")
+    img = soup.select_one("#landingImage")
+    imagen = img.get("src") if img else None
 
-    precio_actual, precio_anterior, descuento = extraer_precios(soup)
-    if not precio_actual:
+    precio, recomendado, desc = extraer_precios(soup)
+    precio_cupon = extraer_precio_cupon(soup)
+    tiene_cupon = False
+
+    if precio_cupon:
+        if precio and precio_cupon >= precio:
+            registrar_descartado(asin, "Cupón falso (no reduce precio)", precio_cupon, recomendado, desc)
+            return None
+
+        precio = precio_cupon
+        tiene_cupon = True
+        if recomendado:
+            desc = round((recomendado - precio) / recomendado * 100)
+
+    if not precio or not recomendado:
+        registrar_descartado(asin, "Precios no disponibles", precio, recomendado, desc)
         return None
-    if descuento < MIN_DESCUENTO_PCT:
+
+    if precio >= recomendado:
+        registrar_descartado(asin, "Precio >= recomendado", precio, recomendado, desc)
         return None
 
-    producto = {
+    if desc < MIN_DESCUENTO_PCT:
+        registrar_descartado(asin, "Descuento insuficiente", precio, recomendado, desc)
+        return None
+
+    return {
         "asin": asin,
         "titulo": titulo,
         "imagen": imagen,
-        "precio_actual": precio_actual,
-        "precio_anterior": precio_anterior,
-        "descuento": descuento,
-        "url_scrape": url,
+        "precio": precio,
+        "tiene_cupon": tiene_cupon,
+        "recomendado": recomendado,
+        "descuento": desc,
         "url": crear_url_afiliado(asin)
     }
-    log(f"Producto OK: {asin} | -{descuento}% | {formatear_precio_europeo(precio_actual)} (antes {formatear_precio_europeo(precio_anterior)})")
-    return producto
 
-# ----------------- TELEGRAM -----------------
-def enviar_telegram(producto):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        log("TOKEN o CHAT_ID no configurado. Saltando envío Telegram.")
-        return
+
+# ============================================================
+#                       TELEGRAM
+# ============================================================
+def enviar_telegram(p):
     try:
-        bf_msg = "🔥🔥🔥 <b>BLACK FRIDAY</b> 🔥🔥🔥\n\n" if producto['descuento'] > BLACK_FRIDAY_PCT else ""
-        caption = f"{bf_msg}<b>{producto['titulo']}</b>\n\n"
-        caption += f"<b>💰 Precio:</b> {formatear_precio_europeo(producto['precio_actual'])}\n"
-        if producto.get('precio_anterior'):
-            caption += f"<b>📉 Precio recomendado:</b> {formatear_precio_europeo(producto['precio_anterior'])}\n"
-        if producto.get('descuento'):
-            caption += f"<b>🔥 -{producto['descuento']}% de descuento</b>\n\n"
-        caption += f"{producto['url']}"  # solo link de afiliado
+        cap = f"<b>{p['titulo']}</b>\n"
 
-        img_resp = requests.get(producto['imagen'], timeout=20)
-        img_resp.raise_for_status()
-        img_bytes = img_resp.content
-        files = {"photo": ("image.jpg", img_bytes)}
+        if p.get("tiene_cupon"):
+            cap += "🔥 <b>CUPÓN ACTIVADO</b>\n"
+
+        cap += f"\n<b>Precio:</b> {fmt(p['precio'])}\n"
+        cap += f"<b>Recomendado:</b> {fmt(p['recomendado'])}\n"
+        cap += f"<b>Descuento:</b> -{p['descuento']}%\n\n"
+        cap += p["url"]
+
+        img = requests.get(p["imagen"], timeout=15).content
 
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
-            data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML", "disable_web_page_preview": "false"},
-            files=files,
-            timeout=30
+            data={"chat_id": CHAT_ID, "caption": cap, "parse_mode": "HTML"},
+            files={"photo": ("img.jpg", img)}
         )
 
         if r.status_code == 200:
-            log(f"Enviado Telegram: {producto['asin']}")
+            log(f"{OK}Enviado Telegram → {p['asin']}{RESET}")
         else:
-            log(f"Error Telegram {r.status_code}: {r.text}")
+            log(f"{ERR}Error Telegram {r.status_code}: {r.text}{RESET}")
 
     except Exception as e:
-        log(f"ERROR enviando Telegram {producto.get('asin','?')}: {e}")
+        log(f"{ERR}ERROR Telegram: {e}{RESET}")
 
-# ----------------- GUARDADO -----------------
-def deduplicar_y_guardar(productos):
-    asin_map = {p["asin"]: p for p in productos}
-    lista = list(asin_map.values())
-    if not lista:
+
+# ============================================================
+#                    GUARDAR EXCEL
+# ============================================================
+def guardar_excel(productos):
+    if not productos:
         return
-    df = pd.DataFrame(lista)
-    df['precio_actual'] = df['precio_actual'].apply(lambda x: formatear_precio_europeo(x))
-    df['precio_anterior'] = df['precio_anterior'].apply(lambda x: formatear_precio_europeo(x))
+    df = pd.DataFrame(productos)
+    df["precio"] = df["precio"].apply(fmt)
+    df["recomendado"] = df["recomendado"].apply(fmt)
     try:
         df.to_excel(EXCEL_FILE, index=False)
     except Exception as e:
-        log(f"Error guardando Excel: {e}")
+        log(f"{ERR}Error guardando Excel: {e}{RESET}")
 
-# ----------------- BUCLE PRINCIPAL -----------------
-def main_loop():
+
+# ============================================================
+#                    BUCLE PRINCIPAL
+# ============================================================
+def bot_loop():
     ensure_dirs()
     historial = cargar_historial()
+
     while True:
         try:
             urls = buscar_productos()
-            if not urls:
-                log("No se encontraron URLs. Reintentando pronto...")
-                time.sleep(10)
-                continue
-            productos_encontrados = []
-            for url in urls:
-                p = get_product_info(url)
+            productos = []
+
+            for u in urls:
+                p = get_product_info(u)
                 if p and not fue_enviado_recientemente(p["asin"], historial):
                     enviar_telegram(p)
                     registrar_envio(p["asin"], historial)
-                    productos_encontrados.append(p)
-                    log("⏳ Esperando 15 minutos antes del siguiente envío...")
-                    time.sleep(15 * 60)
-            if productos_encontrados:
-                deduplicar_y_guardar(productos_encontrados)
-            log("⏳ Ciclo terminado. Esperando 15 minutos...\n")
-            time.sleep(15 * 60)
-        except KeyboardInterrupt:
-            log("Interrupción por teclado")
-            break
-        except Exception as e:
-            log(f"ERROR inesperado: {e}")
-            log(traceback.format_exc())
-            time.sleep(60)
+                    productos.append(p)
 
+                    log(f"{CYAN}⏳ Esperando 15 minutos...{RESET}")
+                    time.sleep(900)
+
+            guardar_excel(productos)
+            log("✔ Ciclo completo. Esperando 15 minutos...\n")
+            time.sleep(900)
+
+        except Exception as e:
+            log(f"{ERR}ERROR general: {e}{RESET}")
+            log(traceback.format_exc())
+            time.sleep(30)
+
+
+# ============================================================
+#               SERVIDOR WEB (mantiene activo en Render)
+# ============================================================
+app_web = Flask(__name__)
+
+@app_web.route("/")
+def home():
+    return "Amazon Bot is running on Render."
+
+
+def start_web():
+    app_web.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+
+
+# ============================================================
+#            LANZAR EL WEB SERVER + BOT EN PARALELO
+# ============================================================
 if __name__ == "__main__":
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        log("⚠️ Atención: TELEGRAM_TOKEN o CHAT_ID no configurado.")
-    log("🚀 Sistema Amazon iniciado (precio extraído de aok-offscreen, descuento calculado).")
-    main_loop()
+    threading.Thread(target=start_web).start()
+    bot_loop()
