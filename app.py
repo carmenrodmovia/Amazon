@@ -27,6 +27,7 @@ def start_web():
 def send_telegram(message: str):
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
     CHAT_ID = os.getenv("CHAT_ID")
+    TAG = "crt06f-21"
 
     if not TELEGRAM_TOKEN or not CHAT_ID:
         print("❌ ERROR TELEGRAM: Falta TELEGRAM_TOKEN o CHAT_ID en las variables de entorno.")
