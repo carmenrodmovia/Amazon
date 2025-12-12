@@ -31,12 +31,11 @@ HISTORIAL_FILE = "enviados_historial.json"
 NO_REPEAT_DAYS = 15
 
 PALABRAS_CLAVE = [
-    "Hogar",
-    "ropa",
-    "television",
+    "Cuidado personal",
+    "Haribo",
+    "Chocolate",
     "Bricolaje",
-    "tablet",
-    "Belleza"
+    "deporte"
 ]
 
 HEADERS_ROTATIVOS = [
