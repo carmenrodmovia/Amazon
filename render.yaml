@@ -1,8 +1,7 @@
-
 services:
-  - type: worker
-    name: mi-script-python
+  - type: web
+    name: amazon-python-app
     env: python
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python main.py"
+    startCommand: "gunicorn app:app --bind 0.0.0.0:$PORT"
     plan: free
